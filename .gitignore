@@ -1,0 +1,41 @@
+# ==============================================================================
+# Git 忽略配置 · PvZGE 移动端移植与性能补丁项目
+# ==============================================================================
+
+# 1. 游戏资源与载荷（BYOR 规范：本仓库不分发任何商业/同人游戏美术与音频素材）
+*.zip
+*.apk
+*.aab
+*.exe
+stage/
+pvzge_web-*/
+android-gardendless/app/src/main/assets/*.zip
+!android-gardendless/app/src/main/assets/.gitkeep
+
+# 2. 敏感凭据与本地机器路径
+keystore.jks
+*.jks
+*.keystore
+keystore.properties
+local.properties
+android-gardendless/keystore.jks
+android-gardendless/keystore.properties
+android-gardendless/local.properties
+
+# 3. 构建产物与缓存
+.gradle/
+build/
+**/build/
+android-gardendless/.gradle/
+android-gardendless/**/build/
+*.log
+build-release.log
+
+# 4. 系统与 IDE 文件
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
+*.iml
+*.sublime-project
+*.sublime-workspace
