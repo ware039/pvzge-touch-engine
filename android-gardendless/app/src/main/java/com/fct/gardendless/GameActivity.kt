@@ -172,6 +172,20 @@ class GameActivity : AppCompatActivity() {
                 fun setExportName(name: String) {
                     pendingExportName = name
                 }
+                @JavascriptInterface
+                fun exportSave(content: String, fileName: String) {
+                    webView.post {
+                        pendingExport = content.toByteArray(Charsets.UTF_8)
+                        pendingExportName = fileName
+                        val type = mimeFromExtension(fileName) ?: "application/json"
+                        val intent = Intent(Intent.ACTION_CREATE_DOCUMENT).apply {
+                            this.type = type
+                            addCategory(Intent.CATEGORY_OPENABLE)
+                            putExtra(Intent.EXTRA_TITLE, fileName)
+                        }
+                        startActivityForResult(intent, EXPORT_SAVE_RESULT_CODE)
+                    }
+                }
 
                 // ---- Tauri FS 兼容层（供注入页面的 tauri-shim.js 调用）----
                 @JavascriptInterface
@@ -422,6 +436,8 @@ class GameActivity : AppCompatActivity() {
             // 2. 开启协程/后台线程处理 IO
             GlobalScope.launch(Dispatchers.IO) {
                 try {
+                    // 清理旧版本解压目录，防止跨版本更新残留孤儿资源；不影响 gpnext 与 WebView 存档
+                    File(filesDir, "pvzge_web-master").deleteRecursively()
                     assets.open("pvzge_web-master.zip").use { inputStream ->
                         ZipInputStream(inputStream).use { zis ->
                             var entry = zis.nextEntry
@@ -450,6 +466,7 @@ class GameActivity : AppCompatActivity() {
                     e.printStackTrace()
                     withContext(Dispatchers.Main) {
                         dialog.dismiss()
+                        Toast.makeText(this@GameActivity, "资源解压失败: ${e.message}", Toast.LENGTH_LONG).show()
                     }
                 }
             }
@@ -826,7 +843,10 @@ class GameActivity : AppCompatActivity() {
       if (typeof ti.convertFileSrc !== 'function') ti.convertFileSrc = function (p) { return String(p); };
       if (!ti.plugins) ti.plugins = {};
       window.__TAURI_INTERNALS__ = ti;
-      if (!window.__TAURI__) window.__TAURI__ = { core: { invoke: invoke }, tauri: { invoke: invoke } };
+      // 严禁暴露 window.__TAURI__：游戏导出存档逻辑依赖 !(a=window.__TAURI__) 判定走网页端导出分支（<a>.download + click 触发 Android 原生 setDownloadListener 捕获）。
+      // 若暴露 __TAURI__ 却未完整实现桌面端的 dialog.save / fs.writeTextFile，会导致存档导出报 TypeError 崩溃。
+      // GP Next 仅依赖 window.__TAURI_INTERNALS__。
+      try { if ('__TAURI__' in window) delete window.__TAURI__; } catch (e) { window.__TAURI__ = undefined; }
       D.tauri.installedAt = Date.now();
 
       // ---- 自动修复：GP Next 上次因缺 FS 而半途失败（助手函数没定义、调用点却留下了），
@@ -894,6 +914,22 @@ class GameActivity : AppCompatActivity() {
 
     var bridge = window.GardendlessBridge;
 
+    // 0.16.24+ Web 启动路径会无条件创建 window.electronAPI（仅含音乐包/弹窗等 Web 方法），
+    // 但缺少 ElectronAPI.ts 在 preSplashScene/mainScene 调用的桌面窗口与分辨率方法；
+    // 补全缺失的桌面方法桩（仅在缺失时填充，不覆盖已有方法），防止 TypeError 阻断进入 splashScene 导致黑屏。
+    try {
+        var eApi = window.electronAPI = window.electronAPI || {};
+        var eNoop = function() {};
+        var eVoidMethods = ['window', 'center', 'fullScreen', 'setSize', 'setResolution', 'openUrl', 'openDevTools', 'closeDevTools', 'toggleDevTools', 'nircmd', 'quit'];
+        for (var ei = 0; ei < eVoidMethods.length; ei++) {
+            if (typeof eApi[eVoidMethods[ei]] !== 'function') eApi[eVoidMethods[ei]] = eNoop;
+        }
+        if (typeof eApi.isFullScreen !== 'function') eApi.isFullScreen = function() { return Promise.resolve(false); };
+        if (typeof eApi.getCurrentResolutionSync !== 'function') eApi.getCurrentResolutionSync = function() { return ''; };
+        if (typeof eApi.getAllResolutionsSync !== 'function') eApi.getAllResolutionsSync = function() { return []; };
+        if (typeof eApi.getMassageSync !== 'function') eApi.getMassageSync = function() { return ''; };
+    } catch (e) {}
+
     // 快速触控分发：预编译常驻调度器，消除每次点击动态 eval 闭包开销
     window.__pvzFastDispatch = function(x, y, type, button) {
         var el = document.getElementById("GameCanvas");
@@ -929,14 +965,46 @@ class GameActivity : AppCompatActivity() {
         try { bridge.setExportName(String(name)); } catch (e) { /* 忽略 */ }
     };
 
-    // 下载命名：游戏用 <a download="名字" href="data:..."> + click() 触发导出，
-    // 文件名只存在于 a.download 上，不会传给原生，故在此捕获
+    // 下载命名与 Blob 导出跟踪
+    var origCreateObjectURL = URL.createObjectURL;
+    var blobCache = {};
+    if (origCreateObjectURL) {
+        URL.createObjectURL = function(blob) {
+            var url = origCreateObjectURL.apply(this, arguments);
+            if (blob && url) blobCache[url] = blob;
+            return url;
+        };
+    }
+    var origRevokeObjectURL = URL.revokeObjectURL;
+    if (origRevokeObjectURL) {
+        URL.revokeObjectURL = function(url) {
+            setTimeout(function() {
+                delete blobCache[url];
+                try { origRevokeObjectURL.call(URL, url); } catch (e) {}
+            }, 5000);
+        };
+    }
+
     var isDataHref = function(el) {
         return (el && el.getAttribute && (el.getAttribute('href') || '').indexOf('data:') === 0);
     };
     var origClick = HTMLAnchorElement.prototype.click;
     HTMLAnchorElement.prototype.click = function() {
-        if (this.download && isDataHref(this)) setExportName(this.download);
+        var name = this.download || (this.getAttribute && this.getAttribute('download'));
+        var href = this.href || (this.getAttribute && this.getAttribute('href')) || '';
+        if (name) {
+            if (isDataHref(this)) {
+                setExportName(name);
+            } else if (href.indexOf('blob:') === 0 && blobCache[href] && bridge && typeof bridge.exportSave === 'function') {
+                var blob = blobCache[href];
+                var reader = new FileReader();
+                reader.onload = function() {
+                    try { bridge.exportSave(reader.result, name); } catch(e) {}
+                };
+                reader.readAsText(blob);
+                return;
+            }
+        }
         return origClick.apply(this, arguments);
     };
     document.addEventListener('click', function(e) {
