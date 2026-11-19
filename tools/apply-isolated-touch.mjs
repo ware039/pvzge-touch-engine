@@ -53,9 +53,13 @@ let mainJs = fs.readFileSync(mainJsPath, 'utf8');
 
 // (a) 进出关卡标记 window.__isInGame
 if (!mainJs.includes('window.__isInGame=!0')) {
-  mainJs = mainJs.replace(/this\.GoToScene\("inGameScene",!t\);case \d+:this\.isInGame=!0[,;]/, '$&window.__isInGame=!0,');
-  mainJs = mainJs.replace(/case 4:return this\.isInGame=!1,/, '$&window.__isInGame=!1,');
-  mainJs = mainJs.replace(/([a-zA-Z0-9_$]+)\.isInGame=!1,/g, '$1.isInGame=!1,window.__isInGame=!1,');
+  const goToInGameRe = /this\.GoToScene\("inGameScene",!\w+\);case \d+:this\.isInGame=!0[,;]/;
+  if (!goToInGameRe.test(mainJs)) {
+    throw new Error('无法定位 GoToScene("inGameScene") isInGame=!0 锚点，拒绝写入');
+  }
+  mainJs = mainJs.replace(goToInGameRe, '$&window.__isInGame=!0,');
+  mainJs = mainJs.replace(/case 4:return this\.isInGame=!1,(?!window\.__isInGame)/, '$&window.__isInGame=!1,');
+  mainJs = mainJs.replace(/([a-zA-Z0-9_$]+)\.isInGame=!1,(?!window\.__isInGame)/g, '$1.isInGame=!1,window.__isInGame=!1,');
   console.log('✓ assets/main/index.js: KeyListener window.__isInGame flags injected');
 } else {
   console.log('- assets/main/index.js: KeyListener flags already present');
@@ -170,7 +174,7 @@ if (mainJs.includes(LNC_PROMOTE_MARK)) {
 // 做法：一次性迁移键。首次启动强制 PocketUI=true 并落键；**此后完全尊重存档与游戏内开关**
 //       （设置窗口里那个「PocketUI」按钮可随时切回顶部，颜色绿=侧边/红=顶部）。
 const POCKET_ANCHOR = 'D.PocketUI=(e.PocketUI===undefined||e.PocketUI===null)?!0:!!e.PocketUI,';
-const POCKET_ANCHOR_16 = 'F.PocketUI=!!e.PocketUI,';
+const POCKET_ANCHOR_16_RE = /\b(\w+)\.PocketUI=!!e\.PocketUI,/g;
 const POCKET_MIGR = 'w.localStorage.getItem("__pvzgePocketSideV1")||(D.PocketUI=!0,w.localStorage.setItem("__pvzgePocketSideV1","1")),';
 const POCKET_MIGR_16 = '(typeof window!=="undefined"&&window.localStorage&&!window.localStorage.getItem("__pvzgePocketSideV1")?(e.PocketUI=!0,window.localStorage.setItem("__pvzgePocketSideV1","1")):0),';
 const POCKET_MARK = '__pvzgePocketSideV1';
@@ -181,13 +185,17 @@ if (mainJs.includes(POCKET_MARK)) {
   if (pocketHits !== 1) throw new Error(`PocketUI 读取锚点命中 ${pocketHits} 次，期望 1 次`);
   mainJs = mainJs.replace(POCKET_ANCHOR, POCKET_ANCHOR + POCKET_MIGR);
   console.log('✓ assets/main/index.js: 侧边卡片栏（PocketUI）一次性迁移已注入 (0.15)');
-} else if (mainJs.includes(POCKET_ANCHOR_16)) {
-  const pocketHits = mainJs.split(POCKET_ANCHOR_16).length - 1;
-  if (pocketHits !== 1) throw new Error(`PocketUI 0.16 读取锚点命中 ${pocketHits} 次，期望 1 次`);
-  mainJs = mainJs.replace(POCKET_ANCHOR_16, POCKET_MIGR_16 + POCKET_ANCHOR_16);
-  console.log('✓ assets/main/index.js: 侧边卡片栏（PocketUI）一次性迁移已注入 (0.16)');
 } else {
-  console.warn('WARN: 未匹配到 PocketUI 锚点，跳过该项');
+  const pocket16Matches = [...mainJs.matchAll(POCKET_ANCHOR_16_RE)];
+  if (pocket16Matches.length === 1) {
+    const matched = pocket16Matches[0][0];
+    mainJs = mainJs.replace(matched, POCKET_MIGR_16 + matched);
+    console.log(`✓ assets/main/index.js: 侧边卡片栏（PocketUI）一次性迁移已注入 (0.16, var=${pocket16Matches[0][1]})`);
+  } else if (pocket16Matches.length > 1) {
+    throw new Error(`PocketUI 0.16 读取锚点命中 ${pocket16Matches.length} 次，期望 1 次`);
+  } else {
+    console.warn('WARN: 未匹配到 PocketUI 锚点，跳过该项');
+  }
 }
 
 // (b4) 掉落植物卡（DroppedCards）触控几何击中判定补丁
@@ -299,6 +307,51 @@ if (mainJs.includes(OLD_LATE_UPDATE)) {
   console.log('- assets/main/index.js: Mouse.ts 触屏划线防瞬移误吸补丁已存在（幂等）');
 } else {
   console.warn('WARN: 未匹配到 Mouse.lateUpdate 原型，可能已被修改，跳过本步骤');
+}
+
+// 6. assets/main/index.js: 导出存档（zi / Gi）Android 原生 SAF 桥接补丁
+const EXPORT_TARGET_RE = /(\w+)=new Blob\(\[(\w+)\],\{type:"application\/json"\}\),(\w+)=URL\.createObjectURL\(\1\),\((\w+)=document\.createElement\("a"\)\)\.download=(\w+)\+"\.json",\4\.href=\3,\4\.click\(\),URL\.revokeObjectURL\(\3\)/g;
+
+if (mainJs.includes('GardendlessBridge.exportSave')) {
+  console.log('- assets/main/index.js: 导出存档 Android 原生 SAF 桥接补丁已存在');
+} else {
+  const exportMatches = [...mainJs.matchAll(EXPORT_TARGET_RE)];
+  if (exportMatches.length !== 1) {
+    throw new Error(`导出存档 Blob 锚点命中 ${exportMatches.length} 次，期望 1 次`);
+  }
+  const em = exportMatches[0];
+  const contentVar = em[2];
+  const anchorVar = em[4];
+  const nameVar = em[5];
+  const EXPORT_REPLACEMENT = `(window.GardendlessBridge&&typeof window.GardendlessBridge.exportSave==="function")?window.GardendlessBridge.exportSave(${contentVar},${nameVar}+".json"):((${anchorVar}=document.createElement("a")).download=${nameVar}+".json",${anchorVar}.href="data:application/json;charset=utf-8,"+encodeURIComponent(${contentVar}),${anchorVar}.click())`;
+  mainJs = mainJs.replace(em[0], EXPORT_REPLACEMENT);
+  console.log(`✓ assets/main/index.js: 导出存档 Android 原生 SAF 桥接补丁已注入 (content=${contentVar}, name=${nameVar})`);
+}
+
+// 7. assets/main/index.js: ElectronAPI.ts 桌面方法兜底补丁（0.16.24+ Web 启动会先创建仅含 Web 方法的 window.electronAPI，
+// 若尚未挂载桌面方法桩，preSplashScene.start() 调用 ElectronAPI.window() 会直接抛 TypeError 导致黑屏）
+const EAPI_HEAD = 'System.register("chunks:///_virtual/ElectronAPI.ts"';
+const eapiStart = mainJs.indexOf(EAPI_HEAD);
+if (eapiStart >= 0) {
+  const eapiEnd = mainJs.indexOf('System.register(', eapiStart + EAPI_HEAD.length);
+  const eapiMod = mainJs.slice(eapiStart, eapiEnd > 0 ? eapiEnd : eapiStart + 8000);
+  const eapiMark = '__pvzgeElectronApiStub';
+  const eapiGetterRe = /var (\w+)=(\w+)\.ccclass,(\w+)=function\(\)\{return window\.electronAPI\};/;
+  if (eapiMod.includes(eapiMark)) {
+    console.log('- assets/main/index.js: ElectronAPI 桌面方法兜底已存在');
+  } else {
+    const gm = eapiMod.match(eapiGetterRe);
+    if (!gm) {
+      throw new Error('无法定位 ElectronAPI.ts getter 锚点，拒绝写入');
+    }
+    const replacement =
+      `var ${gm[1]}=${gm[2]}.ccclass,${gm[3]}=function(){var _a=window.electronAPI;if(_a&&!_a.${eapiMark}){_a.${eapiMark}=1;var _z=function(){};["window","center","fullScreen","setSize","setResolution","openUrl","openDevTools","closeDevTools","toggleDevTools","nircmd","quit"].forEach((function(k){if(typeof _a[k]!=="function")_a[k]=_z}));if(typeof _a.isFullScreen!=="function")_a.isFullScreen=function(){return Promise.resolve(!1)};if(typeof _a.getCurrentResolutionSync!=="function")_a.getCurrentResolutionSync=function(){return""};if(typeof _a.getAllResolutionsSync!=="function")_a.getAllResolutionsSync=function(){return[]};if(typeof _a.getMassageSync!=="function")_a.getMassageSync=function(){return""}}return _a};`;
+    const patchedEapiMod = eapiMod.replace(gm[0], replacement);
+    mainJs = mainJs.slice(0, eapiStart) + patchedEapiMod + (eapiEnd > 0 ? mainJs.slice(eapiEnd) : '');
+    console.log('✓ assets/main/index.js: ElectronAPI.ts 桌面方法兜底已注入');
+  }
+} else {
+  console.warn('WARN: 未定位到 ElectronAPI.ts 模块，跳过 Step 7');
 }
 
 // 语法校验
